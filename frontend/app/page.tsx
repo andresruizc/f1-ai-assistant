@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { getStandings, getTrackStatus } from "@/lib/api";
 import type { Driver, RaceMetadata, StandingsEntry, TrackStatus } from "@/lib/types";
 
@@ -53,6 +54,13 @@ export default function Home() {
           <span className="text-xl">🏎️</span>
           <h1 className="text-lg font-bold">AI Race Engineer</h1>
         </div>
+
+        <Link
+          href="/dashboard"
+          className="block w-full rounded-md bg-gradient-to-r from-red-600 to-orange-500 px-4 py-2 text-sm font-medium text-white text-center hover:brightness-110 transition"
+        >
+          📊 Full Dashboard
+        </Link>
 
         <RaceSelector onRaceLoaded={handleRaceLoaded} />
 

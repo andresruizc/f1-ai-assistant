@@ -34,7 +34,10 @@ TEAM_COLORS: dict[str, str] = {
     "Alpine": "#0093CC",
     "Williams": "#64C4FF",
     "Racing Bulls": "#6692FF",
+    "RB": "#6692FF",
+    "AlphaTauri": "#5E8FAA",
     "Kick Sauber": "#52E252",
+    "Alfa Romeo": "#C92D4B",
     "Haas F1 Team": "#B6BABD",
 }
 

@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
-from src.api.routes import chat, race
+from src.api.routes import chat, dashboard, race
 from src.utils.config import settings
 
 
@@ -45,6 +45,7 @@ app.add_middleware(
 # Routes
 app.include_router(race.router, prefix="/api/race", tags=["race"])
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
+app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
 
 
 @app.get("/health")

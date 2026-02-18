@@ -77,6 +77,7 @@ class RaceState:
                 "team": str(row.get("TeamName", "Unknown")),
                 "color": color_map.get(code, "#CCCCCC"),
                 "grid_position": int(row["GridPosition"]) if pd.notna(row.get("GridPosition")) else None,
+                "headshot": str(row.get("HeadshotUrl", "")) if pd.notna(row.get("HeadshotUrl")) else "",
             }
 
         # Precompute cumulative times for gap calculations
@@ -102,6 +103,7 @@ class RaceState:
                 "name": info["name"],
                 "team": info["team"],
                 "color": info["color"],
+                "headshot": info.get("headshot", ""),
             }
             for code, info in self.drivers.items()
         ]
