@@ -35,8 +35,13 @@ dependencies = [
 [project.scripts]
 f1-data-loader = "src.data_loader:main"
 f1-api = "src.api.main:cli"
+f1-dashboard = "src.dashboard.app:main"
 
 [project.optional-dependencies]
+viz = [
+    "streamlit>=1.30.0",
+    "plotly>=5.18.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",

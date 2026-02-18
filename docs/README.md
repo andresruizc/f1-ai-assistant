@@ -12,7 +12,8 @@ docs/
 │   └── race-data-guide.md              # ★ Master reference for AI agents & analysis
 ├── guides/                              # How-to guides for developers
 │   ├── getting-started.md               # Setup, running, first steps
-│   └── cli-reference.md                # All CLI commands, flags, and examples
+│   ├── cli-reference.md                # All CLI commands, flags, and examples
+│   └── dashboard-visualizations.md     # How each chart is built from CSV data
 └── changelog/                           # Chronological log of what was built and why
     ├── 001-data-loader.md               # F1DataLoader for 2025 season
     ├── 002-csv-export.md                # CSV export with Timedelta conversion
@@ -25,6 +26,7 @@ docs/
 - **What data is available?** Read `architecture/data-sources.md` for every column in every DataFrame (10 datasets).
 - **Building something new?** Check `architecture/data-layer.md` for the full `F1DataLoader` API.
 - **How do I run X?** Read `guides/cli-reference.md` for all CLI commands and flags.
+- **How are the charts built?** Read `guides/dashboard-visualizations.md` for step-by-step breakdowns of every visualization.
 - **Just getting started?** Read `guides/getting-started.md`.
 - **Want to see what changed recently?** Browse `changelog/` (numbered sequentially).
 

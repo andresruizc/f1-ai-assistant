@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help init test dev-api dev-frontend format lint docker-up docker-down clean load-data
+.PHONY: help init test dev-api dev-frontend dashboard format lint docker-up docker-down clean load-data
 
 help:
 	@echo "F1 Race Engineer — Project Commands"
@@ -14,6 +14,7 @@ help:
 	@echo "  make docker-down     # Stop all services"
 	@echo "  make clean           # Remove cache files"
 	@echo "  make load-data       # Download all 2025 race data"
+	@echo "  make dashboard       # Launch Streamlit race dashboard"
 	@echo ""
 	@echo "CLI commands (via uv run):"
 	@echo "  uv run f1-data-loader --info         # Show 2025 schedule"
@@ -43,6 +44,9 @@ lint:
 
 load-data:
 	uv run f1-data-loader
+
+dashboard:
+	uv run streamlit run src/dashboard/app.py
 
 docker-up:
 	cd deployment/docker && docker compose up --build -d
