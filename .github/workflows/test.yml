@@ -1,0 +1,412 @@
+name: CI/CD Pipeline
+
+# When to run this workflow
+on:
+  push:
+    branches: [main, develop]  # Run on pushes to main or develop branches
+  pull_request:
+    branches: [main]             # Run on pull requests to main
+
+# What to do
+jobs:
+  # Phase 1: Automated Testing
+  # COMMENTED OUT: Tests disabled to speed up CI/CD pipeline
+  test:
+    name: Run Python Tests
+    runs-on: ubuntu-latest        # Run on Ubuntu Linux (free GitHub-hosted runner)
+    
+    steps:
+      # Step 1: Checkout (download) your code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 2: Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      # Step 3: Clean up disk space (GitHub runners have limited space)
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h
+      
+      # Step 4: Install uv (your package manager)
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      # Step 5: Install project dependencies (skip torch - tests use mocks)
+      - name: Install dependencies
+        run: |
+          # Tests use mocks for embedders, so torch/transformers aren't needed
+          # Install in editable mode first (without dependencies)
+          uv pip install --system -e . --no-deps
+          # Install all dependencies except torch and torchvision (saves ~3GB)
+          uv pip install --system \
+            "docling>=2.63.0" "docling-core>=2.52.0" "docling-parse>=4.7.1" "pypdf>=3.17.0" \
+            "transformers>=4.57.0" \
+            "langchain-text-splitters>=0.0.1" \
+            "qdrant-client>=1.7.0" \
+            "langchain>=0.1.0" "langchain-community>=0.0.13" "langchain-openai>=0.0.5" "langchain-anthropic>=0.1.0" \
+            "langgraph>=0.2.0" "langsmith>=0.1.0" \
+            "openai>=1.10.0" "anthropic>=0.8.0" "litellm>=1.0.0" \
+            "sentence-transformers>=2.2.0" "flashrank>=0.2.0" \
+            "fastapi>=0.104.0" "uvicorn[standard]>=0.24.0" \
+            "fastmcp>=2.0.0" \
+            "python-dotenv>=1.0.0" "pyyaml>=6.0.1" "loguru>=0.7.2" \
+            "httpx>=0.26.0" "aiohttp>=3.9.0" "beautifulsoup4>=4.12.0" \
+            "crawl4ai>=0.3.0" \
+            "prometheus-client>=0.19.0" "tenacity>=8.2.3" "tqdm>=4.66.0" \
+            "pandas>=2.3.3" "pydantic>=2.5.0" "pydantic-settings>=2.1.0" "click>=8.1.0" \
+            "ragas>=0.4.1" "datasets>=4.4.1" "langchain-huggingface>=1.2.0" \
+            "matplotlib>=3.10.8" "seaborn>=0.13.2"
+          # Install dev dependencies
+          uv pip install --system \
+            "pytest>=7.4.0" "pytest-asyncio>=0.21.0" "pytest-cov>=4.1.0" \
+            "black>=24.0.0" "ruff>=0.1.0" "mypy>=1.8.0" "ipython>=8.20.0"
+      
+      # Step 7: Run your tests
+      - name: Run tests
+        run: |
+          uv run pytest tests/ -v
+      
+      # Step 8: Generate coverage report (optional, but useful)
+      - name: Generate coverage report
+        run: |
+          uv run pytest tests/ --cov=src --cov-report=xml --cov-report=term
+        continue-on-error: true  # Don't fail if coverage is low
+
+  # Phase 2: Docker Build - API
+  build-api:
+    name: Build API Docker Image
+    needs: test  # COMMENTED OUT: Tests disabled, build runs immediately
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 2: Free up disk space (GitHub runners have limited space)
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+      
+      # Step 3: Set up Docker Buildx (enhanced Docker with caching)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # Step 4: Build API Docker image
+      # Skip model pre-download in CI to save time and space (models not needed for verification)
+      - name: Build API Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false  # Don't push yet (that's Phase 3)
+          tags: esa-iagen-api:latest
+          build-args: |
+            PRELOAD_MODELS=false
+          cache-from: type=gha  # Use GitHub Actions cache
+          cache-to: type=gha,mode=min,compression=zstd  # Fast cache: only final layers, zstd compression
+      
+      # Step 5: Verify API image was built
+      - name: Verify API image
+        run: |
+          docker images esa-iagen-api:latest
+          echo "✅ API Docker image built successfully!"
+
+  # Phase 3: Push to ECR - API
+  push-api:
+    name: Push API Image to ECR
+    needs: build-api  # Only push if build succeeds
+    runs-on: ubuntu-latest
+    # Only push on main branch (not on PRs or develop)
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 2: Free up disk space (critical for large Docker builds with models)
+      - name: Free up disk space
+        run: |
+          echo "📊 Disk space before cleanup:"
+          df -h
+          echo ""
+          echo "🧹 Cleaning up disk space..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          # Clean up Docker to free space
+          docker system prune -af --volumes || true
+          echo ""
+          echo "📊 Disk space after cleanup:"
+          df -h
+      
+      # Step 3: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      # Step 4: Login to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      # Step 5: Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # Step 6: Build and push API image to ECR
+      - name: Build and push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true  # Push to ECR!
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/esa-iagen-api:latest
+            ${{ steps.login-ecr.outputs.registry }}/esa-iagen-api:${{ github.sha }}
+          build-args: |
+            PRELOAD_MODELS=true  # Include models for production
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,compression=zstd  # Cache all layers including models
+      
+      # Step 7: Clean up Docker after build to free space
+      - name: Clean up Docker after build
+        run: |
+          echo "🧹 Cleaning up Docker after build..."
+          docker system prune -af --volumes || true
+          echo "📊 Final disk space:"
+          df -h
+      
+      # Step 8: Verify push succeeded
+      - name: Verify image pushed
+        run: |
+          echo "✅ API image pushed to ECR!"
+          echo "Repository: ${{ steps.login-ecr.outputs.registry }}/esa-iagen-api"
+          echo "Tags: latest, ${{ github.sha }}"
+
+  # Phase 2: Docker Build - Frontend
+  build-frontend:
+    name: Build Frontend Docker Image
+    needs: test  # COMMENTED OUT: Tests disabled, build runs immediately
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 2: Free up disk space (GitHub runners have limited space)
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+      
+      # Step 3: Set up Docker Buildx (enhanced Docker with caching)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # Step 4: Build Frontend Docker image
+      - name: Build Frontend Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: false  # Don't push yet (that's Phase 3)
+          tags: esa-iagen-frontend:latest
+          cache-from: type=gha  # Use GitHub Actions cache
+          cache-to: type=gha,mode=min,compression=zstd  # Fast cache: only final layers, zstd compression
+      
+      # Step 5: Verify Frontend image was built
+      - name: Verify Frontend image
+        run: |
+          docker images esa-iagen-frontend:latest
+          echo "✅ Frontend Docker image built successfully!"
+
+  # Phase 3: Push to ECR - Frontend
+  push-frontend:
+    name: Push Frontend Image to ECR
+    needs: build-frontend  # Only push if build succeeds
+    runs-on: ubuntu-latest
+    # Only push on main branch (not on PRs or develop)
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 2: Free up disk space
+      - name: Free up disk space
+        run: |
+          echo "📊 Disk space before cleanup:"
+          df -h
+          echo ""
+          echo "🧹 Cleaning up disk space..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          # Clean up Docker to free space
+          docker system prune -af --volumes || true
+          echo ""
+          echo "📊 Disk space after cleanup:"
+          df -h
+      
+      # Step 3: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      # Step 4: Login to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      # Step 5: Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # Step 6: Get ALB DNS name from AWS
+      - name: Get ALB DNS name
+        id: get-alb
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names esa-iagen-api-alb \
+            --region ${{ secrets.AWS_REGION }} \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text 2>/dev/null || echo "")
+          if [ -z "$ALB_DNS" ] || [ "$ALB_DNS" = "None" ]; then
+            echo "⚠️  ALB not found, using default localhost"
+            echo "api_url=http://localhost:8002" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Found ALB: $ALB_DNS"
+            echo "api_url=http://$ALB_DNS" >> $GITHUB_OUTPUT
+          fi
+      
+      # Step 7: Build and push Frontend image to ECR
+      - name: Build and push Frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true  # Push to ECR!
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/esa-iagen-frontend:latest
+            ${{ steps.login-ecr.outputs.registry }}/esa-iagen-frontend:${{ github.sha }}
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ steps.get-alb.outputs.api_url }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,compression=zstd  # Cache all layers including dependencies
+      
+      # Step 8: Clean up Docker after build
+      - name: Clean up Docker after build
+        run: |
+          echo "🧹 Cleaning up Docker after build..."
+          docker system prune -af --volumes || true
+          echo "📊 Final disk space:"
+          df -h
+      
+      # Step 9: Verify push succeeded
+      - name: Verify image pushed
+        run: |
+          echo "✅ Frontend image pushed to ECR!"
+          echo "Repository: ${{ steps.login-ecr.outputs.registry }}/esa-iagen-frontend"
+          echo "Tags: latest, ${{ github.sha }}"
+
+  # Phase 4: Deploy to ECS - API
+  deploy-api:
+    name: Deploy API to ECS
+    needs: push-api  # Only deploy if push succeeds
+    runs-on: ubuntu-latest
+    # Only deploy on main branch (not on PRs or develop)
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      # Step 1: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      # Step 2: Update ECS service to force new deployment
+      - name: Deploy API to ECS
+        run: |
+          echo "🚀 Deploying API to ECS..."
+          aws ecs update-service \
+            --cluster esa-iagen-cluster \
+            --service esa-iagen-api-service \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }} \
+            --query 'service.serviceName' \
+            --output text
+          echo "✅ API deployment triggered!"
+          echo "   ECS will pull the new image and restart the container."
+          echo "   This may take a few minutes. Check AWS Console for status."
+
+  # Phase 4: Deploy to ECS - Frontend
+  deploy-frontend:
+    name: Deploy Frontend to ECS
+    needs: push-frontend  # Only deploy if push succeeds
+    runs-on: ubuntu-latest
+    # Only deploy on main branch (not on PRs or develop)
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      # Step 1: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      # Step 2: Update ECS service to force new deployment
+      - name: Deploy Frontend to ECS
+        run: |
+          echo "🚀 Deploying Frontend to ECS..."
+          aws ecs update-service \
+            --cluster esa-iagen-cluster \
+            --service esa-iagen-frontend-service \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }} \
+            --query 'service.serviceName' \
+            --output text
+          echo "✅ Frontend deployment triggered!"
+          echo "   ECS will pull the new image and restart the container."
+          echo "   This may take a few minutes. Check AWS Console for status."
+

@@ -1,0 +1,33 @@
+# F1 AI Race Engineer Configuration
+
+app:
+  name: "F1 AI Race Engineer"
+  version: "0.1.0"
+  debug: false
+
+# LLM Configuration (via LiteLLM)
+llm:
+  provider: "anthropic"
+  model: "claude-3-haiku"
+  temperature: 0.2
+  max_tokens: 4096
+
+# FastF1
+fastf1:
+  cache_dir: "data/.fastf1_cache"
+  min_year: 2020
+  max_year: 2025
+
+# API
+api:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://localhost:3001"
+    - "http://127.0.0.1:3000"
+    - "http://frontend:3000"
+
+# Logging
+logging:
+  level: "INFO"
