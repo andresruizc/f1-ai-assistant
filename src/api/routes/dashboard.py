@@ -288,7 +288,7 @@ async def track_map(driver: str = Query("", description="Optional driver for GPS
 # ------------------------------------------------------------------
 
 @router.get("/replay")
-async def replay_data(interval: float = Query(4.0, ge=1.0, le=10.0)):
+async def replay_data(interval: float = Query(0.25, ge=0.1, le=10.0)):
     """Pre-computed replay frames with full telemetry per driver.
 
     Each frame includes per-driver: x, y, speed, throttle, brake, gear, drs.
@@ -364,6 +364,10 @@ async def replay_data(interval: float = Query(4.0, ge=1.0, le=10.0)):
         "frames": frames_out,
         "total_frames": meta["total_frames"],
         "total_laps": meta["total_laps"],
+        "event_name": svc.race_state.event_name,
+        "circuit": svc.race_state.circuit_name,
+        "country": svc.race_state.country,
+        "year": svc.race_state.year,
         "race_start": meta["race_start"],
         "race_end": meta["race_end"],
         "sample_interval": meta["sample_interval"],

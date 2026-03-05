@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, Suspense, lazy } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import RaceSelector from "@/components/RaceSelector";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import type { RaceMetadata } from "@/lib/types";
@@ -10,9 +10,11 @@ const OverviewTab = lazy(() => import("@/components/dashboard/OverviewTab"));
 const StandingsStrategyTab = lazy(() => import("@/components/dashboard/StandingsStrategyTab"));
 const TelemetryTab = lazy(() => import("@/components/dashboard/TelemetryTab"));
 const ReplayTab = lazy(() => import("@/components/dashboard/ReplayTab"));
+const EngineerTab = lazy(() => import("@/components/dashboard/EngineerTab"));
 
 const TABS = [
   { id: "replay", label: "Race Replay", icon: "🏎️" },
+  { id: "engineer", label: "Race Engineer", icon: "🛠️" },
   { id: "overview", label: "Overview", icon: "🏆" },
   { id: "standings", label: "Standings & Strategy", icon: "📊" },
   { id: "telemetry", label: "Telemetry", icon: "📈" },
@@ -33,14 +35,29 @@ export default function DashboardPage() {
   const [activeTab, setActiveTab] = useState<TabId>("overview");
   const [metadata, setMetadata] = useState<RaceMetadata | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [mountedTabs, setMountedTabs] = useState<TabId[]>(["overview"]);
+
+  const mountTab = (tab: TabId) => {
+    setMountedTabs((prev) => (prev.includes(tab) ? prev : [...prev, tab]));
+  };
 
   const handleRaceLoaded = (meta: RaceMetadata, _driver: string) => {
     setMetadata(meta);
     setActiveTab("replay");
+    // Preload both heavy live tabs so switching feels instant.
+    setMountedTabs((prev) => {
+      const next = new Set<TabId>(prev);
+      next.add("replay");
+      next.add("engineer");
+      return Array.from(next);
+    });
   };
 
   const isLoaded = metadata !== null;
-  const isReplay = activeTab === "replay";
+  const isReplay = activeTab === "replay" || activeTab === "engineer";
+  const raceKey = metadata
+    ? `${metadata.year}-${metadata.event_name}-${metadata.circuit}`
+    : "no-race";
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
@@ -73,7 +90,10 @@ export default function DashboardPage() {
               {TABS.map((tab) => (
                 <button
                   key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
+                  onClick={() => {
+                    mountTab(tab.id);
+                    setActiveTab(tab.id);
+                  }}
                   className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs font-medium transition-all ${
                     activeTab === tab.id
                       ? "bg-primary/10 text-primary border border-primary/20"
@@ -156,23 +176,43 @@ export default function DashboardPage() {
               </p>
             </motion.div>
 
-            <AnimatePresence mode="wait">
-              <motion.div
-                key={activeTab}
-                initial={{ opacity: 0, y: isReplay ? 0 : 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: isReplay ? 0 : -10 }}
-                transition={{ duration: 0.15 }}
-                className=""
-              >
-                <Suspense fallback={<TabFallback />}>
-                  {activeTab === "replay" && <ReplayTab />}
-                  {activeTab === "overview" && <OverviewTab />}
-                  {activeTab === "standings" && <StandingsStrategyTab />}
-                  {activeTab === "telemetry" && <TelemetryTab />}
-                </Suspense>
-              </motion.div>
-            </AnimatePresence>
+            <div>
+              {mountedTabs.includes("replay") && (
+                <div className={activeTab === "replay" ? "block" : "hidden"}>
+                  <Suspense fallback={<TabFallback />}>
+                    <ReplayTab raceKey={raceKey} isActive={activeTab === "replay"} />
+                  </Suspense>
+                </div>
+              )}
+              {mountedTabs.includes("engineer") && (
+                <div className={activeTab === "engineer" ? "block" : "hidden"}>
+                  <Suspense fallback={<TabFallback />}>
+                    <EngineerTab raceKey={raceKey} isActive={activeTab === "engineer"} />
+                  </Suspense>
+                </div>
+              )}
+              {mountedTabs.includes("overview") && (
+                <div className={activeTab === "overview" ? "block" : "hidden"}>
+                  <Suspense fallback={<TabFallback />}>
+                    <OverviewTab />
+                  </Suspense>
+                </div>
+              )}
+              {mountedTabs.includes("standings") && (
+                <div className={activeTab === "standings" ? "block" : "hidden"}>
+                  <Suspense fallback={<TabFallback />}>
+                    <StandingsStrategyTab />
+                  </Suspense>
+                </div>
+              )}
+              {mountedTabs.includes("telemetry") && (
+                <div className={activeTab === "telemetry" ? "block" : "hidden"}>
+                  <Suspense fallback={<TabFallback />}>
+                    <TelemetryTab />
+                  </Suspense>
+                </div>
+              )}
+            </div>
           </div>
         )}
       </main>

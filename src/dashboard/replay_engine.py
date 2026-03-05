@@ -28,6 +28,35 @@ def _to_float(val) -> float | None:
         return None
 
 
+def _smooth_series(values: np.ndarray, passes: int = 1) -> np.ndarray:
+    """Light smoothing for interpolated trajectories to reduce GPS jitter."""
+    if values.size < 5:
+        return values
+    out = values.copy()
+    kernel = np.array([1.0, 2.0, 1.0], dtype=float) / 4.0
+
+    for _ in range(max(1, passes)):
+        finite = np.isfinite(out)
+        if not finite.any():
+            return out
+        idx = np.where(finite)[0]
+        start = idx[0]
+        prev = idx[0]
+        for i in idx[1:]:
+            if i != prev + 1:
+                seg = out[start:prev + 1]
+                if seg.size >= 3:
+                    padded = np.pad(seg, (1, 1), mode="edge")
+                    out[start:prev + 1] = np.convolve(padded, kernel, mode="valid")
+                start = i
+            prev = i
+        seg = out[start:prev + 1]
+        if seg.size >= 3:
+            padded = np.pad(seg, (1, 1), mode="edge")
+            out[start:prev + 1] = np.convolve(padded, kernel, mode="valid")
+    return out
+
+
 def _rotate_arrays(x, y, deg, cx, cy):
     """Rotate arrays of x/y coordinates around (cx, cy) by deg degrees."""
     rad = np.radians(deg)
@@ -36,9 +65,33 @@ def _rotate_arrays(x, y, deg, cx, cy):
     return cx + dx * cos_r - dy * sin_r, cy + dx * sin_r + dy * cos_r
 
 
+def _get_rotation_center(session, pos_data) -> tuple[float, float]:
+    """Pick one shared rotation pivot for track + all drivers."""
+    try:
+        fastest = session.laps.pick_fastest()
+        tel = fastest.get_telemetry()
+        if not tel.empty and "X" in tel.columns and "Y" in tel.columns:
+            x = pd.to_numeric(tel["X"], errors="coerce").dropna()
+            y = pd.to_numeric(tel["Y"], errors="coerce").dropna()
+            if not x.empty and not y.empty:
+                return float(x.mean()), float(y.mean())
+    except Exception:
+        pass
+
+    for pos_df in pos_data.values():
+        p = pos_df.copy()
+        p["X"] = pd.to_numeric(p.get("X"), errors="coerce")
+        p["Y"] = pd.to_numeric(p.get("Y"), errors="coerce")
+        p = p.dropna(subset=["X", "Y"])
+        if not p.empty:
+            return float(p["X"].mean()), float(p["Y"].mean())
+
+    return 0.0, 0.0
+
+
 def build_replay_data(
     session,
-    sample_interval: float = 2.0,
+    sample_interval: float = 0.25,
 ) -> dict:
     """Pre-compute all driver positions + telemetry on a common time grid.
 
@@ -103,6 +156,10 @@ def build_replay_data(
     # ── Build compound lookup (driver → list of (session_time, compound, tyre_life)) ──
     compound_lookup = _build_compound_lookup(laps)
 
+    # Use one shared pivot for all rotated geometry. Rotating each driver around
+    # a different center can shift cars off the road even when source data is valid.
+    rot_cx, rot_cy = _get_rotation_center(session, pos_data)
+
     # ── Interpolate all drivers ──
     frames: dict[int, list[dict]] = {i: [] for i in range(total_frames)}
     all_x: list[float] = []
@@ -121,6 +178,8 @@ def build_replay_data(
         t = pos["SessionTimeS"].values
         x_interp = np.interp(time_grid, t, pos["X"].values, left=np.nan, right=np.nan)
         y_interp = np.interp(time_grid, t, pos["Y"].values, left=np.nan, right=np.nan)
+        x_interp = _smooth_series(x_interp, passes=1)
+        y_interp = _smooth_series(y_interp, passes=1)
 
         # Interpolate full telemetry channels from car_data
         speed_interp = np.full(total_frames, np.nan)
@@ -128,6 +187,7 @@ def build_replay_data(
         brake_interp = np.full(total_frames, np.nan)
         gear_interp = np.full(total_frames, np.nan)
         drs_interp = np.full(total_frames, np.nan)
+        rpm_interp = np.full(total_frames, np.nan)
 
         if isinstance(car_data, dict) and driver_num in car_data:
             cd = car_data[driver_num].copy()
@@ -150,12 +210,13 @@ def build_replay_data(
                 if "DRS" in cd.columns:
                     vals = pd.to_numeric(cd["DRS"], errors="coerce").values
                     drs_interp = np.interp(time_grid, ct, vals, left=np.nan, right=np.nan)
+                if "RPM" in cd.columns:
+                    vals = pd.to_numeric(cd["RPM"], errors="coerce").values
+                    rpm_interp = np.interp(time_grid, ct, vals, left=np.nan, right=np.nan)
 
         # Apply rotation once during build
         if rotation_deg != 0:
-            cx_all = np.nanmean(x_interp)
-            cy_all = np.nanmean(y_interp)
-            x_rot, y_rot = _rotate_arrays(x_interp, y_interp, rotation_deg, cx_all, cy_all)
+            x_rot, y_rot = _rotate_arrays(x_interp, y_interp, rotation_deg, rot_cx, rot_cy)
         else:
             x_rot, y_rot = x_interp, y_interp
 
@@ -171,30 +232,29 @@ def build_replay_data(
                 "brake": _safe_float(brake_interp[i]),
                 "gear": _safe_int(gear_interp[i]),
                 "drs": _safe_int(drs_interp[i]),
+                "rpm": _safe_int(rpm_interp[i]),
                 "color": color,
             })
             all_x.append(float(x_rot[i]))
             all_y.append(float(y_rot[i]))
 
     # ── High-res track outline from fastest lap telemetry ──
-    track_x, track_y = _build_hires_track(session, rotation_deg)
+    track_x, track_y = _build_hires_track(session, rotation_deg, rot_cx, rot_cy)
 
     # If hi-res failed, fall back to raw pos_data approach
     if not track_x:
         track_x, track_y = _build_fallback_track(
-            pos_data, driver_map, laps, race_start, race_end, rotation_deg,
+            pos_data, driver_map, laps, race_start, race_end, rotation_deg, rot_cx, rot_cy,
         )
 
     # ── Corner markers (rotated) ──
     corner_data = None
     if corners is not None and not corners.empty:
-        cx_c = np.mean(all_x) if all_x else 0
-        cy_c = np.mean(all_y) if all_y else 0
         if rotation_deg != 0:
             rx, ry = _rotate_arrays(
                 corners["X"].values.astype(float),
                 corners["Y"].values.astype(float),
-                rotation_deg, cx_c, cy_c,
+                rotation_deg, rot_cx, rot_cy,
             )
             corner_data = {"x": rx.tolist(), "y": ry.tolist(), "numbers": corners["Number"].tolist()}
         else:
@@ -217,7 +277,7 @@ def build_replay_data(
             retired_drivers[code] = status
 
     # ── DRS zones: detect from fastest lap telemetry ──
-    drs_zones = _build_drs_zones(session, rotation_deg)
+    drs_zones = _build_drs_zones(session, rotation_deg, rot_cx, rot_cy)
 
     # ── Weather timeline ──
     weather_timeline = _build_weather_timeline(session, race_start)
@@ -280,7 +340,7 @@ def _safe_int(v) -> int:
 
 # ── High-res track from telemetry ──────────────────────────────────
 
-def _build_hires_track(session, rotation_deg: float) -> tuple[list, list]:
+def _build_hires_track(session, rotation_deg: float, rot_cx: float, rot_cy: float) -> tuple[list, list]:
     """Use the fastest lap's telemetry X/Y for a high-res circuit outline."""
     try:
         fastest = session.laps.pick_fastest()
@@ -292,8 +352,7 @@ def _build_hires_track(session, rotation_deg: float) -> tuple[list, list]:
         y = tel["Y"].values.astype(float)
 
         if rotation_deg != 0:
-            cx, cy = np.nanmean(x), np.nanmean(y)
-            x, y = _rotate_arrays(x, y, rotation_deg, cx, cy)
+            x, y = _rotate_arrays(x, y, rotation_deg, rot_cx, rot_cy)
 
         # Downsample to ~600 points for smooth but fast rendering
         step = max(1, len(x) // 600)
@@ -303,7 +362,7 @@ def _build_hires_track(session, rotation_deg: float) -> tuple[list, list]:
         return [], []
 
 
-def _build_fallback_track(pos_data, driver_map, laps, race_start, race_end, rotation_deg):
+def _build_fallback_track(pos_data, driver_map, laps, race_start, race_end, rotation_deg, rot_cx, rot_cy):
     """Fallback: use raw position data from first driver."""
     first_code = list(driver_map.values())[0] if driver_map else None
     if not first_code:
@@ -320,8 +379,7 @@ def _build_fallback_track(pos_data, driver_map, laps, race_start, race_end, rota
     ox = pos["X"].values[:n].copy().astype(float)
     oy = pos["Y"].values[:n].copy().astype(float)
     if rotation_deg != 0:
-        cx, cy = ox.mean(), oy.mean()
-        ox, oy = _rotate_arrays(ox, oy, rotation_deg, cx, cy)
+        ox, oy = _rotate_arrays(ox, oy, rotation_deg, rot_cx, rot_cy)
     return ox.tolist(), oy.tolist()
 
 
@@ -384,7 +442,7 @@ def _build_cumtime_lookup(laps: pd.DataFrame) -> dict[str, list[tuple[int, float
     return lookup
 
 
-def _build_drs_zones(session, rotation_deg: float) -> list[dict]:
+def _build_drs_zones(session, rotation_deg: float, rot_cx: float, rot_cy: float) -> list[dict]:
     """Extract DRS zones from the lap with most DRS usage."""
     try:
         best_tel = None
@@ -423,8 +481,7 @@ def _build_drs_zones(session, rotation_deg: float) -> list[dict]:
         drs = pd.to_numeric(best_tel["DRS"], errors="coerce").values
 
         if rotation_deg != 0:
-            cx, cy = np.nanmean(x), np.nanmean(y)
-            x, y = _rotate_arrays(x, y, rotation_deg, cx, cy)
+            x, y = _rotate_arrays(x, y, rotation_deg, rot_cx, rot_cy)
 
         zones: list[dict] = []
         in_zone = False
@@ -493,11 +550,19 @@ def _build_sector_lookup(laps: pd.DataFrame) -> dict[str, dict[int, dict]]:
             best_s3 = s3
         if driver not in lookup:
             lookup[driver] = {}
+        lap_time = _to_float(row.get("LapTime"))
         lookup[driver][lap_num] = {
             "s1": round(s1, 3) if s1 else None,
             "s2": round(s2, 3) if s2 else None,
             "s3": round(s3, 3) if s3 else None,
             "pb": bool(row.get("IsPersonalBest", False)),
+            "lapTime": round(lap_time, 3) if lap_time else None,
+            "speedI1": float(row["SpeedI1"]) if pd.notna(row.get("SpeedI1")) else None,
+            "speedI2": float(row["SpeedI2"]) if pd.notna(row.get("SpeedI2")) else None,
+            "speedFL": float(row["SpeedFL"]) if pd.notna(row.get("SpeedFL")) else None,
+            "speedST": float(row["SpeedST"]) if pd.notna(row.get("SpeedST")) else None,
+            "stint": int(row["Stint"]) if pd.notna(row.get("Stint")) else None,
+            "freshTyre": bool(row.get("FreshTyre", False)) if pd.notna(row.get("FreshTyre")) else None,
         }
 
     # Tag session-best sectors

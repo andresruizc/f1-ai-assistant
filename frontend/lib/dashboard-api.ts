@@ -95,6 +95,7 @@ export interface ReplayDriver {
   brake: number;
   gear: number;
   drs: number;
+  rpm: number;
   color: string;
 }
 
@@ -134,6 +135,13 @@ export interface SectorData {
   s1_best: boolean;
   s2_best: boolean;
   s3_best: boolean;
+  lapTime: number | null;
+  speedI1: number | null;
+  speedI2: number | null;
+  speedFL: number | null;
+  speedST: number | null;
+  stint: number | null;
+  freshTyre: boolean | null;
 }
 
 export interface RcMessage {
@@ -156,6 +164,10 @@ export interface ReplayData {
   frames: Record<string, ReplayFrame>;
   total_frames: number;
   total_laps: number;
+  event_name?: string;
+  circuit?: string;
+  country?: string;
+  year?: number;
   race_start: number;
   race_end: number;
   sample_interval: number;
@@ -199,7 +211,7 @@ export const dashboardApi = {
     get<TelemetryCompareData>(`/api/dashboard/telemetry-compare?drivers=${drivers.join(",")}&lap=${lap}`),
   trackMap: (driver?: string) =>
     get<TrackMapData>(`/api/dashboard/track-map${driver ? "?driver=" + driver : ""}`),
-  replay: (interval = 4) =>
+  replay: (interval = 0.25) =>
     get<ReplayData>(`/api/dashboard/replay?interval=${interval}`),
   positionHistory: () =>
     get<PositionHistoryData>("/api/dashboard/position-history-full"),

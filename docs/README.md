@@ -13,7 +13,9 @@ docs/
 ├── guides/                              # How-to guides for developers
 │   ├── getting-started.md               # Setup, running, first steps
 │   ├── cli-reference.md                # All CLI commands, flags, and examples
-│   └── dashboard-visualizations.md     # How each chart is built from CSV data
+│   ├── dashboard-visualizations.md     # How each chart is built from CSV data
+│   └── replay-fluid-animation.md       # How smooth replay interpolation works
+│   └── replay-troubleshooting-and-fixes.md # Practical replay issues and applied fixes
 └── changelog/                           # Chronological log of what was built and why
     ├── 001-data-loader.md               # F1DataLoader for 2025 season
     ├── 002-csv-export.md                # CSV export with Timedelta conversion
@@ -27,6 +29,8 @@ docs/
 - **Building something new?** Check `architecture/data-layer.md` for the full `F1DataLoader` API.
 - **How do I run X?** Read `guides/cli-reference.md` for all CLI commands and flags.
 - **How are the charts built?** Read `guides/dashboard-visualizations.md` for step-by-step breakdowns of every visualization.
+- **How does smooth replay work?** Read `guides/replay-fluid-animation.md` for sampling + interpolation details.
+- **What was fixed and why?** Read `guides/replay-troubleshooting-and-fixes.md` for a full troubleshooting log.
 - **Just getting started?** Read `guides/getting-started.md`.
 - **Want to see what changed recently?** Browse `changelog/` (numbered sequentially).
 
