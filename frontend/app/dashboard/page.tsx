@@ -113,14 +113,6 @@ export default function DashboardPage() {
             </nav>
           )}
 
-          {/* Race info */}
-          {metadata && (
-            <div className="p-3 border-t border-border text-[10px] text-muted-foreground space-y-0.5">
-              <p className="font-medium text-foreground text-xs">{metadata.event_name}</p>
-              <p>{metadata.circuit}, {metadata.country}</p>
-              <p>{metadata.year} — {metadata.total_laps} laps</p>
-            </div>
-          )}
         </div>
       </aside>
 

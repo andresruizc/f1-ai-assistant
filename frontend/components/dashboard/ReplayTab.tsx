@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { dashboardApi, type ReplayData, type ReplayFrame, type ReplayDriver, type WeatherEntry, type SectorData, type RcMessage } from "@/lib/dashboard-api";
+import { dashboardApi, type ReplayData, type ReplayFrame, type ReplayDriver, type SectorData, type RcMessage } from "@/lib/dashboard-api";
 import { tyreColor } from "@/lib/tyre-colors";
 
 const SPEEDS = [
@@ -43,6 +43,13 @@ function fmt(secs: number): string {
 function fmtSector(s: number | null): string {
   if (s == null) return "—";
   return s < 60 ? s.toFixed(3) : `${Math.floor(s / 60)}:${(s % 60).toFixed(3).padStart(6, "0")}`;
+}
+
+function getTrackStrokeWidths(viewW: number, viewH: number): { outer: number; inner: number; halfWorldPx: number } {
+  const base = Math.min(viewW, viewH);
+  const outer = Math.max(14, Math.min(20, base * 0.03));
+  const inner = Math.max(9, outer - 5);
+  return { outer, inner, halfWorldPx: inner * 0.5 };
 }
 
 function nearestTrackPointOnPolyline(
@@ -93,6 +100,58 @@ function lockPointToTrack(
   return [x, y];
 }
 
+function estimateDrsZonesFromTrack(
+  trackX: number[],
+  trackY: number[],
+  maxZones = 2,
+): Array<{ x: number[]; y: number[] }> {
+  const n = Math.min(trackX.length, trackY.length);
+  if (n < 24) return [];
+
+  const curvature = new Array<number>(n).fill(Math.PI);
+  for (let i = 1; i < n - 1; i++) {
+    const ax = trackX[i] - trackX[i - 1];
+    const ay = trackY[i] - trackY[i - 1];
+    const bx = trackX[i + 1] - trackX[i];
+    const by = trackY[i + 1] - trackY[i];
+    const amag = Math.hypot(ax, ay);
+    const bmag = Math.hypot(bx, by);
+    if (amag < 1e-6 || bmag < 1e-6) continue;
+    const dot = (ax * bx + ay * by) / (amag * bmag);
+    const clamped = Math.max(-1, Math.min(1, dot));
+    curvature[i] = Math.abs(Math.acos(clamped));
+  }
+
+  const isStraight = curvature.map((c) => c < 0.075);
+  const minRun = Math.max(10, Math.floor(n * 0.035));
+  const runs: Array<{ start: number; end: number; score: number }> = [];
+  let i = 0;
+  while (i < n) {
+    if (!isStraight[i]) {
+      i++;
+      continue;
+    }
+    const start = i;
+    while (i < n && isStraight[i]) i++;
+    const end = i - 1;
+    const lenPts = end - start + 1;
+    if (lenPts < minRun) continue;
+    let lengthScore = 0;
+    for (let k = start + 1; k <= end; k++) {
+      lengthScore += Math.hypot(trackX[k] - trackX[k - 1], trackY[k] - trackY[k - 1]);
+    }
+    runs.push({ start, end, score: lengthScore });
+  }
+
+  if (!runs.length) return [];
+  runs.sort((a, b) => b.score - a.score);
+
+  return runs.slice(0, maxZones).map((r) => ({
+    x: trackX.slice(r.start, r.end + 1),
+    y: trackY.slice(r.start, r.end + 1),
+  }));
+}
+
 function countryToFlag(country?: string): string {
   if (!country) return "🏁";
   const map: Record<string, string> = {
@@ -123,16 +182,6 @@ function countryToFlag(country?: string): string {
   return map[country] ?? "🏁";
 }
 
-function getWeatherAt(weather: WeatherEntry[], elapsed: number): WeatherEntry | null {
-  if (!weather.length) return null;
-  let best = weather[0];
-  for (const w of weather) {
-    if (w.t <= elapsed) best = w;
-    else break;
-  }
-  return best;
-}
-
 function getRecentRc(messages: RcMessage[], elapsed: number, count = 4): RcMessage[] {
   return messages.filter((m) => m.t <= elapsed).slice(-count);
 }
@@ -142,6 +191,50 @@ const FLAG_COLORS: Record<string, string> = {
   "DOUBLE YELLOW": "#f59e0b", BLUE: "#3b82f6", BLACK: "#111",
   CHEQUERED: "#888",
 };
+
+const DEFAULT_RENDER_LAYERS = {
+  drs: true,
+  speedHeat: false,
+  throttleBrake: false,
+  pitInfluence: true,
+} as const;
+
+type BattleHint = {
+  ahead: string;
+  behind: string;
+  gapSec: number;
+  deltaSpeed: number;
+  overtakeProb: number;
+};
+
+function parseGapSeconds(v: string): number | null {
+  const m = v.match(/(\d+(?:\.\d+)?)s/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
+function computeBattleHints(frame: ReplayFrame): BattleHint[] {
+  const speedByDriver = new Map(frame.drivers.map((d) => [d.driver, d.speed]));
+  const drsByDriver = new Map(frame.drivers.map((d) => [d.driver, d.drs]));
+  const standings = frame.standings.filter((s) => !s.retired).sort((a, b) => a.p - b.p);
+  const out: BattleHint[] = [];
+  for (let i = 1; i < standings.length; i++) {
+    const behind = standings[i];
+    const ahead = standings[i - 1];
+    const gap = parseGapSeconds(behind.interval) ?? parseGapSeconds(behind.gap);
+    if (gap == null) continue;
+    const deltaSpeed = (speedByDriver.get(behind.d) ?? 0) - (speedByDriver.get(ahead.d) ?? 0);
+    const drsBoost = (drsByDriver.get(behind.d) ?? 0) >= 10 ? 0.15 : 0;
+    const prob = clamp01(((1.2 - gap) / 1.2) * 0.55 + ((deltaSpeed + 20) / 50) * 0.3 + drsBoost);
+    out.push({ ahead: ahead.d, behind: behind.d, gapSec: gap, deltaSpeed, overtakeProb: prob });
+  }
+  return out.sort((a, b) => b.overtakeProb - a.overtakeProb);
+}
 
 function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
@@ -291,6 +384,11 @@ export default function ReplayTab({
   const [uiPlayhead, setUiPlayhead] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speedIdx, setSpeedIdx] = useState(1);
+  const [showDrsOnTrack, setShowDrsOnTrack] = useState(true);
+  const [showLappedMarkers, setShowLappedMarkers] = useState(false);
+  const [battleMode, setBattleMode] = useState(false);
+  const [pitThreatsOn, setPitThreatsOn] = useState(false);
+  const [leaderTrainOn, setLeaderTrainOn] = useState(false);
   const [focused, setFocused] = useState<string[]>([]);
   const [gapMode, setGapMode] = useState<"interval" | "gap">("interval");
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -307,6 +405,9 @@ export default function ReplayTab({
     let cancelled = false;
     setLoading(true);
     setPlaying(false);
+    setBattleMode(false);
+    setPitThreatsOn(false);
+    setLeaderTrainOn(false);
     setFocused([]);
     setUiPlayhead(0);
     playheadRef.current = 0;
@@ -333,6 +434,20 @@ export default function ReplayTab({
   const baseFrame: ReplayFrame | null = data?.frames[String(frameIndex)] ?? null;
   const renderFrame = data ? getRenderFrame(data, uiPlayhead) : null;
   const currentFrame = renderFrame ?? baseFrame;
+  const leaderTrainCodesForEffect = (currentFrame?.standings ?? [])
+    .filter((s) => !s.retired)
+    .slice(0, 5)
+    .map((s) => s.d);
+  const pitThreatCodesForEffect = (currentFrame?.standings ?? [])
+    .filter((s) => !s.retired)
+    .filter((s) => s.inPit || s.tyreLife >= 18)
+    .map((s) => s.d)
+    .slice(0, 6);
+  const battleCodesForEffect = useMemo(() => {
+    if (!currentFrame) return [];
+    const liveBattles = computeBattleHints(currentFrame).filter((b) => b.gapSec < 1.2);
+    return Array.from(new Set(liveBattles.flatMap((b) => [b.ahead, b.behind]))).slice(0, 6);
+  }, [currentFrame]);
   const approxTrackKm = useMemo(() => {
     if (!data) return null;
     const xs = data.track_outline.x;
@@ -346,8 +461,15 @@ export default function ReplayTab({
     const km = sum / 1000;
     return Number.isFinite(km) && km > 1 ? km : null;
   }, [data]);
+  const renderLayers = useMemo(
+    () => ({ ...DEFAULT_RENDER_LAYERS, drs: showDrsOnTrack }),
+    [showDrsOnTrack],
+  );
 
   const toggleFocus = useCallback((code: string) => {
+    setBattleMode(false);
+    setPitThreatsOn(false);
+    setLeaderTrainOn(false);
     setFocused((prev) =>
       prev.includes(code) ? prev.filter((d) => d !== code) : [...prev, code],
     );
@@ -383,8 +505,11 @@ export default function ReplayTab({
 
       let closest: string | null = null;
       let minD = 28;
-      const worldTrackHalfWidth = 12 / Math.max(scale, 1e-6);
+      const retiredSet = new Set(frameForHit.standings.filter((s) => s.retired).map((s) => s.d));
+      const { halfWorldPx } = getTrackStrokeWidths(w, h);
+      const worldTrackHalfWidth = halfWorldPx / Math.max(scale, 1e-6);
       for (const d of frameForHit.drivers) {
+        if (retiredSet.has(d.driver)) continue;
         const [lx, ly] = lockPointToTrack(
           d.x,
           d.y,
@@ -411,6 +536,9 @@ export default function ReplayTab({
       dark: boolean,
       focusSet: Set<string>,
       lowDetail: boolean,
+      layers: { drs: boolean; speedHeat: boolean; throttleBrake: boolean; pitInfluence: boolean },
+      battleDrivers: Set<string>,
+      showLapped: boolean,
     ) => {
       const dpr = window.devicePixelRatio || 1;
       const w = ctx.canvas.width / dpr, h = ctx.canvas.height / dpr;
@@ -419,6 +547,7 @@ export default function ReplayTab({
       const scale = Math.min(w / (xMax - xMin), h / (yMax - yMin)) * 0.92;
       const cx = w / 2, cy = h / 2;
       const xM = (xMin + xMax) / 2, yM = (yMin + yMax) / 2;
+      const trackStroke = getTrackStrokeWidths(w, h);
       const toS = (x: number, y: number): [number, number] => [cx + (x - xM) * scale, cy - (y - yM) * scale];
       const tx = rd.track_outline.x, ty = rd.track_outline.y;
 
@@ -431,6 +560,7 @@ export default function ReplayTab({
         rd.x_range[0], rd.x_range[1], rd.y_range[0], rd.y_range[1],
         tx.length,
         rd.corners?.x.length ?? 0,
+        layers.drs ? "drs1" : "drs0",
       ].join("|");
 
       if (!staticLayerRef.current || staticLayerKeyRef.current !== staticLayerKey) {
@@ -456,19 +586,19 @@ export default function ReplayTab({
 
           trackPath();
           sctx.strokeStyle = dark ? "#1e2140" : "#a8b0c4";
-          sctx.lineWidth = 28;
+          sctx.lineWidth = trackStroke.outer;
           sctx.lineCap = "round";
           sctx.lineJoin = "round";
           sctx.stroke();
 
           trackPath();
           sctx.strokeStyle = dark ? "#10132a" : "#d0d5e3";
-          sctx.lineWidth = 22;
+          sctx.lineWidth = trackStroke.inner;
           sctx.stroke();
 
           trackPath();
           sctx.strokeStyle = dark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.04)";
-          sctx.lineWidth = 1;
+          sctx.lineWidth = 0.8;
           sctx.setLineDash([14, 10]);
           sctx.stroke();
           sctx.setLineDash([]);
@@ -513,16 +643,147 @@ export default function ReplayTab({
           }
 
           if (rd.corners) {
-            sctx.font = "bold 8px system-ui";
+            sctx.font = "600 8px system-ui";
             sctx.textAlign = "center";
+            sctx.textBaseline = "middle";
+
+            const labels: Array<{
+              px: number;
+              py: number;
+              label: string;
+              chipW: number;
+              chipH: number;
+              baseX: number;
+              baseY: number;
+              lx: number;
+              ly: number;
+              nx: number;
+              ny: number;
+            }> = [];
+
             for (let i = 0; i < rd.corners.x.length; i++) {
               const [px, py] = toS(rd.corners.x[i], rd.corners.y[i]);
+              const label = "T" + rd.corners.numbers[i];
+              const tw = sctx.measureText(label).width;
+              const chipW = Math.max(16, tw + 6);
+              const chipH = 10;
+
+              // Compute a local outward normal so labels sit next to turns, not on top of track.
+              const prevIdx = i === 0 ? rd.corners.x.length - 1 : i - 1;
+              const nextIdx = i === rd.corners.x.length - 1 ? 0 : i + 1;
+              const [pPrevX, pPrevY] = toS(rd.corners.x[prevIdx], rd.corners.y[prevIdx]);
+              const [pNextX, pNextY] = toS(rd.corners.x[nextIdx], rd.corners.y[nextIdx]);
+              const txv = pNextX - pPrevX;
+              const tyv = pNextY - pPrevY;
+              const tmag = Math.hypot(txv, tyv) || 1;
+              let nx = -tyv / tmag;
+              let ny = txv / tmag;
+
+              // Flip the normal so it points away from the circuit center.
+              const awayX = px - cx;
+              const awayY = py - cy;
+              if (awayX * nx + awayY * ny < 0) {
+                nx = -nx;
+                ny = -ny;
+              }
+
+              const baseOffset = 15;
+              const baseX = px + nx * baseOffset;
+              const baseY = py + ny * baseOffset;
+              labels.push({
+                px,
+                py,
+                label,
+                chipW,
+                chipH,
+                baseX,
+                baseY,
+                lx: baseX,
+                ly: baseY,
+                nx,
+                ny,
+              });
+            }
+
+            // De-overlap pass for dense areas (e.g. opposite sides close in projection).
+            for (let iter = 0; iter < 10; iter++) {
+              for (let i = 0; i < labels.length; i++) {
+                for (let j = i + 1; j < labels.length; j++) {
+                  const a = labels[i];
+                  const b = labels[j];
+                  const pad = 4;
+                  const dx = a.lx - b.lx;
+                  const dy = a.ly - b.ly;
+                  const minX = (a.chipW + b.chipW) * 0.5 + pad;
+                  const minY = (a.chipH + b.chipH) * 0.5 + pad;
+                  if (Math.abs(dx) < minX && Math.abs(dy) < minY) {
+                    const pushX = (minX - Math.abs(dx)) * 0.24;
+                    const pushY = (minY - Math.abs(dy)) * 0.24;
+                    const sx = dx >= 0 ? 1 : -1;
+                    const sy = dy >= 0 ? 1 : -1;
+                    a.lx += sx * pushX;
+                    b.lx -= sx * pushX;
+                    a.ly += sy * pushY;
+                    b.ly -= sy * pushY;
+                  }
+                }
+              }
+
+              // Keep labels near their curve while still allowing separation.
+              for (const l of labels) {
+                l.lx = l.lx * 0.84 + l.baseX * 0.16 + l.nx * 0.25;
+                l.ly = l.ly * 0.84 + l.baseY * 0.16 + l.ny * 0.25;
+              }
+            }
+
+            for (const l of labels) {
+              const chipX = l.lx - l.chipW / 2;
+              const chipY = l.ly - l.chipH / 2;
+
+              // Small corner anchor + leader line to keep association clear in dense sections.
               sctx.beginPath();
-              sctx.arc(px, py, 2.5, 0, Math.PI * 2);
-              sctx.fillStyle = dark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.1)";
+              sctx.arc(l.px, l.py, 1.8, 0, Math.PI * 2);
+              sctx.fillStyle = dark ? "rgba(248,250,252,0.55)" : "rgba(15,23,42,0.45)";
               sctx.fill();
-              sctx.fillStyle = dark ? "rgba(255,255,255,0.25)" : "rgba(0,0,0,0.2)";
-              sctx.fillText("T" + rd.corners.numbers[i], px, py + 12);
+              sctx.beginPath();
+              sctx.moveTo(l.px, l.py);
+              sctx.lineTo(l.lx - l.nx * 2, l.ly - l.ny * 2);
+              sctx.strokeStyle = dark ? "rgba(248,250,252,0.3)" : "rgba(15,23,42,0.22)";
+              sctx.lineWidth = 1;
+              sctx.stroke();
+
+              // Lighter chip so it does not dominate the map.
+              sctx.fillStyle = dark ? "rgba(17,24,39,0.55)" : "rgba(255,255,255,0.6)";
+              sctx.strokeStyle = dark ? "rgba(248,250,252,0.22)" : "rgba(15,23,42,0.2)";
+              sctx.beginPath();
+              sctx.roundRect(chipX, chipY, l.chipW, l.chipH, 4);
+              sctx.fill();
+              sctx.stroke();
+
+              sctx.fillStyle = dark ? "rgba(248,250,252,0.86)" : "rgba(15,23,42,0.72)";
+              sctx.fillText(l.label, l.lx, l.ly + 0.2);
+            }
+          }
+
+          if (layers.drs) {
+            const drsZones = rd.drs_zones?.length
+              ? rd.drs_zones
+              : estimateDrsZonesFromTrack(rd.track_outline.x, rd.track_outline.y);
+            for (const zone of drsZones) {
+              const n = Math.min(zone.x.length, zone.y.length);
+              if (n < 2) continue;
+              sctx.beginPath();
+              const [zx0, zy0] = toS(zone.x[0], zone.y[0]);
+              sctx.moveTo(zx0, zy0);
+              for (let i = 1; i < n; i++) {
+                const [zx, zy] = toS(zone.x[i], zone.y[i]);
+                sctx.lineTo(zx, zy);
+              }
+              sctx.strokeStyle = rd.drs_zones?.length ? "rgba(34,197,94,0.7)" : "rgba(56,189,248,0.68)";
+              sctx.lineWidth = 3;
+              sctx.setLineDash(rd.drs_zones?.length ? [] : [7, 5]);
+              sctx.stroke();
+              sctx.setLineDash([]);
             }
           }
         }
@@ -535,20 +796,41 @@ export default function ReplayTab({
         ctx.drawImage(staticLayerRef.current, 0, 0, w, h);
       }
 
-      // Drivers: backmarkers first so leaders render on top
-      const sorted = [...f.drivers].sort((a, b) => {
-        const aP = f.standings.find((s) => s.d === a.driver)?.p ?? 99;
-        const bP = f.standings.find((s) => s.d === b.driver)?.p ?? 99;
-        return bP - aP;
-      });
+      // Drivers: backmarkers first so leaders render on top.
+      // Ignore retired drivers so DNF cars disappear from map position.
+      const standingsByDriver = new Map(f.standings.map((s) => [s.d, s]));
+      const activeStandings = f.standings.filter((s) => !s.retired);
+      const leaderLap =
+        activeStandings.find((s) => s.p === 1)?.l ??
+        (activeStandings.length ? Math.max(...activeStandings.map((s) => s.l)) : 0);
+      const sorted = [...f.drivers]
+        .filter((d) => {
+          const st = standingsByDriver.get(d.driver);
+          return !!st && !st.retired;
+        })
+        .sort((a, b) => {
+          const aP = standingsByDriver.get(a.driver)?.p ?? 99;
+          const bP = standingsByDriver.get(b.driver)?.p ?? 99;
+          return bP - aP;
+        });
+      const labelsToDraw: Array<{
+        driver: string;
+        color: string;
+        isFoc: boolean;
+        px: number;
+        py: number;
+        r: number;
+      }> = [];
 
-      for (const [idx, d] of sorted.entries()) {
-        const worldTrackHalfWidth = 12 / Math.max(scale, 1e-6);
+      for (const d of sorted) {
+        const st = standingsByDriver.get(d.driver);
+        const isLapped = st ? (leaderLap - st.l >= 1) : false;
+        const worldTrackHalfWidth = trackStroke.halfWorldPx / Math.max(scale, 1e-6);
         const [lx, ly] = lockPointToTrack(d.x, d.y, tx, ty, worldTrackHalfWidth);
         const [px, py] = toS(lx, ly);
         const isFoc = focusSet.has(d.driver);
+        const isBattle = battleDrivers.has(d.driver);
         const r = isFoc ? 9 : lowDetail ? 4.5 : 5.5;
-        const showLabel = !lowDetail || isFoc || idx < 3;
         const showExtra = !lowDetail || isFoc;
 
         if (showExtra) {
@@ -565,7 +847,7 @@ export default function ReplayTab({
         // Dot
         ctx.beginPath();
         ctx.arc(px, py, r, 0, Math.PI * 2);
-        ctx.fillStyle = d.color;
+        ctx.fillStyle = layers.speedHeat ? speedHue(d.speed) : d.color;
         ctx.fill();
         ctx.strokeStyle = isFoc ? "#fff" : (dark ? "rgba(255,255,255,0.5)" : "#fff");
         ctx.lineWidth = isFoc ? 2.5 : 1.2;
@@ -588,25 +870,62 @@ export default function ReplayTab({
           ctx.stroke();
         }
 
-        if (showLabel) {
-          // Name label
-          ctx.font = `bold ${isFoc ? 9 : 7}px system-ui`;
-          const cached = labelWidthCacheRef.current[d.driver];
-          const tw = cached ?? ctx.measureText(d.driver).width;
-          if (cached == null) labelWidthCacheRef.current[d.driver] = tw;
-          const labelX = px - tw / 2 - 3;
-          const labelY = py - r - 12;
-          ctx.fillStyle = dark ? "rgba(0,0,0,0.75)" : "rgba(255,255,255,0.88)";
+        if (layers.throttleBrake) {
+          const ringColor = d.brake > 30 ? "#ef4444" : d.throttle > 75 ? "#22c55e" : "#f59e0b";
           ctx.beginPath();
-          ctx.roundRect(labelX, labelY, tw + 6, 11, 2);
-          ctx.fill();
-          ctx.strokeStyle = d.color + (isFoc ? "bb" : "44");
-          ctx.lineWidth = isFoc ? 1.2 : 0.4;
+          ctx.arc(px, py, r + 2.8, 0, Math.PI * 2);
+          ctx.strokeStyle = ringColor + "AA";
+          ctx.lineWidth = 1.7;
           ctx.stroke();
-          ctx.fillStyle = dark ? "#eee" : "#1a1a2e";
-          ctx.textAlign = "center";
-          ctx.fillText(d.driver, px, labelY + 8);
         }
+
+        if (layers.pitInfluence) {
+          const st = f.standings.find((s) => s.d === d.driver);
+          if (st?.inPit) {
+            ctx.beginPath();
+            ctx.arc(px, py, r + 8, 0, Math.PI * 2);
+            ctx.strokeStyle = "rgba(250,204,21,0.95)";
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+          }
+        }
+
+        if (isBattle) {
+          ctx.beginPath();
+          ctx.arc(px, py, r + 6.2, 0, Math.PI * 2);
+          ctx.strokeStyle = "rgba(249,115,22,0.95)";
+          ctx.lineWidth = 2.3;
+          ctx.stroke();
+        }
+
+        if (showLapped && isLapped) {
+          ctx.beginPath();
+          ctx.arc(px, py, r + 8.8, 0, Math.PI * 2);
+          ctx.strokeStyle = "rgba(59,130,246,0.95)";
+          ctx.lineWidth = 2.4;
+          ctx.stroke();
+        }
+        labelsToDraw.push({ driver: d.driver, color: d.color, isFoc, px, py, r });
+      }
+
+      // Draw all labels in a final pass so they stay visible above dots/glows.
+      for (const label of labelsToDraw) {
+        ctx.font = `bold ${label.isFoc ? 9 : 7}px system-ui`;
+        const cached = labelWidthCacheRef.current[label.driver];
+        const tw = cached ?? ctx.measureText(label.driver).width;
+        if (cached == null) labelWidthCacheRef.current[label.driver] = tw;
+        const labelX = label.px - tw / 2 - 3;
+        const labelY = label.py - label.r - 12;
+        ctx.fillStyle = dark ? "rgba(0,0,0,0.75)" : "rgba(255,255,255,0.88)";
+        ctx.beginPath();
+        ctx.roundRect(labelX, labelY, tw + 6, 11, 2);
+        ctx.fill();
+        ctx.strokeStyle = label.color + (label.isFoc ? "bb" : "44");
+        ctx.lineWidth = label.isFoc ? 1.2 : 0.4;
+        ctx.stroke();
+        ctx.fillStyle = dark ? "#eee" : "#1a1a2e";
+        ctx.textAlign = "center";
+        ctx.fillText(label.driver, label.px, labelY + 8);
       }
     },
     [],
@@ -640,13 +959,15 @@ export default function ReplayTab({
       if (!frameToDraw) return;
       const ctx = canvasRef.current.getContext("2d");
       if (!ctx) return;
+      const frameBattles = battleMode ? computeBattleHints(frameToDraw).filter((b) => b.gapSec < 1.2) : [];
+      const battleSet = new Set(frameBattles.flatMap((b) => [b.ahead, b.behind]));
       const dpr = window.devicePixelRatio || 1;
       ctx.save();
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      drawFrame(ctx, frameToDraw, data, isDark, new Set(focused), playing);
+      drawFrame(ctx, frameToDraw, data, isDark, new Set(focused), playing, renderLayers, battleSet, showLappedMarkers);
       ctx.restore();
     },
-    [data, drawFrame, focused, isDark, playing],
+    [battleMode, data, drawFrame, focused, isDark, playing, renderLayers, showLappedMarkers],
   );
 
   useEffect(() => {
@@ -698,6 +1019,33 @@ export default function ReplayTab({
     };
   }, [playing, data, speedIdx, drawAtPlayhead]);
 
+  useEffect(() => {
+    if (!leaderTrainOn) return;
+    setFocused((prev) =>
+      prev.length === leaderTrainCodesForEffect.length && prev.every((d, i) => d === leaderTrainCodesForEffect[i])
+        ? prev
+        : leaderTrainCodesForEffect,
+    );
+  }, [leaderTrainOn, leaderTrainCodesForEffect]);
+
+  useEffect(() => {
+    if (!battleMode) return;
+    setFocused((prev) =>
+      prev.length === battleCodesForEffect.length && prev.every((d, i) => d === battleCodesForEffect[i])
+        ? prev
+        : battleCodesForEffect,
+    );
+  }, [battleMode, battleCodesForEffect]);
+
+  useEffect(() => {
+    if (!pitThreatsOn) return;
+    setFocused((prev) =>
+      prev.length === pitThreatCodesForEffect.length && prev.every((d, i) => d === pitThreatCodesForEffect[i])
+        ? prev
+        : pitThreatCodesForEffect,
+    );
+  }, [pitThreatsOn, pitThreatCodesForEffect]);
+
   /* ── Loading / Error ── */
   if (loading) {
     return (
@@ -719,17 +1067,84 @@ export default function ReplayTab({
   }
 
   const progress = data.total_frames > 1 ? (uiPlayhead / (data.total_frames - 1)) * 100 : 0;
-  const focusedDrivers = currentFrame?.drivers.filter((d) => focused.includes(d.driver)) ?? [];
   const activeStandings = currentFrame?.standings.filter((s) => !s.retired) ?? [];
   const retiredStandings = currentFrame?.standings.filter((s) => s.retired) ?? [];
-  const currentWeather = currentFrame ? getWeatherAt(data.weather, currentFrame.elapsed) : null;
+  const activeDriverSet = new Set(activeStandings.map((s) => s.d));
+  const focusedDrivers = currentFrame?.drivers.filter((d) => focused.includes(d.driver) && activeDriverSet.has(d.driver)) ?? [];
+  const leaderTrainCodes = activeStandings.slice(0, 5).map((s) => s.d);
   const recentRc = currentFrame ? getRecentRc(data.rc_messages, currentFrame.elapsed) : [];
   const eventFlag = countryToFlag(data.country);
+  const previousFrame = data.frames[String(Math.max(0, frameIndex - 1))];
+  const battleHints = currentFrame ? computeBattleHints(currentFrame).filter((b) => b.gapSec < 1.2) : [];
+  const prevBattleHints = previousFrame ? computeBattleHints(previousFrame) : [];
+  const prevGapMap = new Map(prevBattleHints.map((b) => [`${b.behind}->${b.ahead}`, b.gapSec]));
+  const battleDriverSet = new Set(battleHints.flatMap((b) => [b.ahead, b.behind]));
+  const drsOpenDrivers = currentFrame?.drivers.filter((d) => d.drs >= 10).length ?? 0;
+  const hasDrsZones = (data.drs_zones?.length ?? 0) > 0;
+  const hasEstimatedDrsZones = !hasDrsZones && estimateDrsZonesFromTrack(data.track_outline.x, data.track_outline.y).length > 0;
+  const leaderLap = activeStandings.find((s) => s.p === 1)?.l ?? 0;
+  const lappedCount = activeStandings.filter((s) => leaderLap - s.l >= 1).length;
+
+  const pitWindowOpen = currentFrame
+    ? currentFrame.lap >= Math.round(data.total_laps * 0.28) && currentFrame.lap <= Math.round(data.total_laps * 0.82)
+    : false;
+
+  const selectedDriverCode = focused[0] ?? activeStandings[0]?.d ?? null;
+  const selectedStanding = selectedDriverCode
+    ? activeStandings.find((s) => s.d === selectedDriverCode) ?? null
+    : null;
+
+  const strategyIntel = (() => {
+    if (!selectedStanding) return null;
+    const pitLossSec = 22;
+    const projectedTyreLife = selectedStanding.tyreLife + Math.max(0, Math.round((data.total_laps - selectedStanding.l) * 0.32));
+    let rejoinPos = selectedStanding.p + Math.round(pitLossSec / 3.3);
+    rejoinPos = Math.max(1, Math.min(rejoinPos, activeStandings.length || 20));
+    const undercutDelta = Math.max(-2.8, Math.min(2.8, (20 - selectedStanding.tyreLife) * 0.06));
+    const overcutDelta = Math.max(-2.8, Math.min(2.8, (selectedStanding.tyreLife - 14) * 0.05));
+    return { pitLossSec, projectedTyreLife, rejoinPos, undercutDelta, overcutDelta };
+  })();
+
+  const tyreCliff = (() => {
+    if (!selectedDriverCode || !selectedStanding) return null;
+    const drvSectors = data.sectors[selectedDriverCode] ?? {};
+    const laps: number[] = [];
+    for (let l = Math.max(2, selectedStanding.l - 7); l <= selectedStanding.l; l++) {
+      const lt = drvSectors[l]?.lapTime;
+      if (typeof lt === "number") laps.push(lt);
+    }
+    if (laps.length < 4) return null;
+    const early = laps.slice(0, Math.floor(laps.length / 2));
+    const late = laps.slice(Math.floor(laps.length / 2));
+    const meanEarly = early.reduce((a, b) => a + b, 0) / early.length;
+    const meanLate = late.reduce((a, b) => a + b, 0) / late.length;
+    const delta = meanLate - meanEarly;
+    return { delta, risk: delta > 0.9 ? "HIGH" : delta > 0.45 ? "MEDIUM" : "LOW" };
+  })();
+
+  const restartPerf = (() => {
+    if (!selectedDriverCode || !currentFrame) return null;
+    const frames = Object.values(data.frames);
+    const idx = Math.floor(Math.max(0, Math.min(uiPlayhead, data.total_frames - 1)));
+    let restartIdx = -1;
+    for (let i = Math.max(1, idx - 250); i <= idx; i++) {
+      const prev = frames[i - 1];
+      const cur = frames[i];
+      if (!prev || !cur) continue;
+      if (prev.status !== "Green" && cur.status === "Green") restartIdx = i;
+    }
+    if (restartIdx < 1) return null;
+    const p0 = frames[Math.max(0, restartIdx - 1)]?.standings.find((s) => s.d === selectedDriverCode)?.p;
+    const p2 = frames[Math.min(frames.length - 1, restartIdx + 30)]?.standings.find((s) => s.d === selectedDriverCode)?.p;
+    if (!p0 || !p2) return null;
+    return p0 - p2;
+  })();
 
   return (
     <div className="flex flex-col rounded-xl border border-border h-[calc(100vh-8rem)] min-h-[620px]">
       {/* ── Top bar: controls ── */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-card/80 backdrop-blur shrink-0">
+        <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground mr-1">Replay</span>
         <button
           onClick={() => setPlaying(!playing)}
           className="w-8 h-8 rounded-full bg-primary text-primary-foreground flex items-center justify-center hover:brightness-110 transition shadow shrink-0"
@@ -750,7 +1165,7 @@ export default function ReplayTab({
             <button
               key={s.label}
               onClick={() => setSpeedIdx(i)}
-              className={`px-2 py-0.5 text-[10px] font-medium transition-colors ${speedIdx === i ? "bg-primary text-primary-foreground" : "bg-card text-muted-foreground hover:bg-muted"}`}
+              className={`px-2 py-0.5 text-[10px] font-semibold transition-colors ${speedIdx === i ? "bg-primary text-primary-foreground" : "bg-card text-muted-foreground hover:bg-muted"}`}
             >
               {s.label}
             </button>
@@ -774,14 +1189,105 @@ export default function ReplayTab({
           <div className="flex items-center gap-2 text-xs shrink-0">
             <span className="font-bold">Lap {currentFrame.lap}/{data.total_laps}</span>
             <span className="text-muted-foreground font-mono text-[10px]">{fmt(currentFrame.elapsed)}</span>
-            <span
-              className="px-1.5 py-0.5 rounded text-[9px] font-bold"
-              style={{ backgroundColor: (STATUS_COLORS[currentFrame.status] ?? "#888") + "20", color: STATUS_COLORS[currentFrame.status] ?? "#888" }}
-            >
-              {currentFrame.status}
-            </span>
           </div>
         )}
+      </div>
+
+      {/* Race context ribbon + actions */}
+      <div className="px-3 py-1.5 border-b border-border bg-muted/20 flex flex-wrap items-center gap-1.5 text-[10px]">
+        <span
+          className="px-2 py-0.5 rounded border font-semibold"
+          style={{ color: STATUS_COLORS[currentFrame?.status ?? "Green"] ?? "#888", borderColor: (STATUS_COLORS[currentFrame?.status ?? "Green"] ?? "#888") + "55" }}
+        >
+          {currentFrame?.status ?? "Green"}
+        </span>
+        <span className={`px-2 py-0.5 rounded border font-semibold ${pitWindowOpen ? "text-green-600 border-green-500/45 bg-green-500/10" : "text-muted-foreground border-border bg-card"}`}>
+          Pit window {pitWindowOpen ? "OPEN" : "CLOSED"}
+        </span>
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            onClick={() => setShowDrsOnTrack((v) => !v)}
+            className={`px-2 py-0.5 rounded border font-semibold transition ${
+              showDrsOnTrack
+                ? "text-green-600 border-green-500/45 bg-green-500/10"
+                : "text-muted-foreground border-border bg-card hover:text-foreground"
+            }`}
+            title={
+              hasDrsZones
+                ? "Toggle DRS zones overlay on the track"
+                : hasEstimatedDrsZones
+                  ? "Official DRS data unavailable: showing estimated DRS zones"
+                  : "DRS zones unavailable for this circuit data"
+            }
+          >
+            DRS track {showDrsOnTrack ? "ON" : "OFF"} · {drsOpenDrivers}
+          </button>
+          <button
+            onClick={() => setShowLappedMarkers((v) => !v)}
+            className={`px-2 py-0.5 rounded border font-semibold transition ${
+              showLappedMarkers
+                ? "text-blue-600 border-blue-500/45 bg-blue-500/10"
+                : "text-muted-foreground border-border bg-card hover:text-foreground"
+            }`}
+            title="Toggle blue markers for lapped cars"
+          >
+            Lapped {showLappedMarkers ? "ON" : "OFF"} · {lappedCount}
+          </button>
+          <button
+            onClick={() => {
+              setBattleMode((prev) => {
+                const next = !prev;
+                setPitThreatsOn(false);
+                setLeaderTrainOn(false);
+                setFocused(next ? battleCodesForEffect : []);
+                return next;
+              });
+            }}
+            className={`px-2 py-0.5 rounded border transition ${
+              battleMode
+                ? "text-orange-500 border-orange-500/45 bg-orange-500/10"
+                : "border-border bg-card text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            Show battles {battleMode ? "ON" : "OFF"}
+          </button>
+          <button
+            onClick={() => {
+              setPitThreatsOn((prev) => {
+                const next = !prev;
+                setBattleMode(false);
+                setLeaderTrainOn(false);
+                setFocused(next ? pitThreatCodesForEffect : []);
+                return next;
+              });
+            }}
+            className={`px-2 py-0.5 rounded border transition ${
+              pitThreatsOn
+                ? "text-amber-500 border-amber-500/45 bg-amber-500/10"
+                : "border-border bg-card text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            Show pit threats {pitThreatsOn ? "ON" : "OFF"}
+          </button>
+          <button
+            onClick={() => {
+              setLeaderTrainOn((prev) => {
+                const next = !prev;
+                setBattleMode(false);
+                setPitThreatsOn(false);
+                setFocused(next ? leaderTrainCodes : []);
+                return next;
+              });
+            }}
+            className={`px-2 py-0.5 rounded border transition ${
+              leaderTrainOn
+                ? "text-primary border-primary/50 bg-primary/10"
+                : "border-border bg-card text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            Focus leader train {leaderTrainOn ? "ON" : "OFF"}
+          </button>
+        </div>
       </div>
 
       {/* ── Main area: Track + Standings ── */}
@@ -795,36 +1301,28 @@ export default function ReplayTab({
           />
 
           {/* Circuit identity badge (top-left) */}
-          <div className="absolute top-2 left-2 rounded-lg border border-border/60 bg-card/88 backdrop-blur-md px-3 py-2 text-[10px] shadow-sm">
-            <div className="flex items-center gap-2">
-              <span className="text-base leading-none">{eventFlag}</span>
-              <div className="min-w-0">
-                <p className="font-bold text-foreground leading-tight truncate">
+          <div className="absolute top-2 left-2 rounded-lg border border-border/60 bg-card/88 backdrop-blur-md px-3 py-2 text-[10px] shadow-sm max-w-[min(440px,60%)]">
+            <div className="flex items-start gap-2">
+              <span className="text-base leading-none mt-0.5">{eventFlag}</span>
+              <div className="min-w-0 space-y-0.5">
+                <p className="font-bold text-foreground leading-snug whitespace-nowrap overflow-hidden text-ellipsis">
                   {data.event_name ?? "Grand Prix"} {data.year ?? ""}
                 </p>
-                <p className="text-muted-foreground leading-tight truncate">
+                <p className="text-muted-foreground leading-snug whitespace-nowrap overflow-hidden text-ellipsis">
                   {data.circuit ?? "Circuit"}{data.country ? `, ${data.country}` : ""}
                 </p>
               </div>
             </div>
-            <div className="flex items-center gap-3 mt-1 text-muted-foreground">
+            <div className="flex items-center gap-3 mt-1.5 pt-1 border-t border-border/40 text-muted-foreground">
               <span>{data.corners?.numbers?.length ?? 0} turns</span>
               {approxTrackKm != null && <span>{approxTrackKm.toFixed(2)} km</span>}
             </div>
           </div>
 
-          {/* Weather widget (top-right) */}
-          {currentWeather && (
-            <div className="absolute top-2 right-2 rounded-lg border border-border/60 bg-card/85 backdrop-blur-md px-2.5 py-1.5 text-[9px] space-y-0.5 pointer-events-none select-none shadow-sm">
-              <div className="flex items-center gap-1.5 text-[10px] font-bold text-foreground">
-                {currentWeather.rainfall ? "🌧" : "☀️"} Weather
-              </div>
-              <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-muted-foreground">
-                <span>Air</span><span className="text-foreground font-medium">{currentWeather.airTemp}°C</span>
-                <span>Track</span><span className="text-foreground font-medium">{currentWeather.trackTemp}°C</span>
-                <span>Humidity</span><span className="text-foreground font-medium">{currentWeather.humidity}%</span>
-                <span>Wind</span><span className="text-foreground font-medium">{currentWeather.windSpeed} km/h</span>
-              </div>
+          {retiredStandings.length > 0 && (
+            <div className="absolute top-2 right-2 rounded-lg border border-red-500/30 bg-card/88 backdrop-blur-md px-2.5 py-1.5 text-[10px] shadow-sm max-w-[45%]">
+              <p className="font-bold text-red-500 uppercase tracking-wider">DNF</p>
+              <p className="text-muted-foreground mt-0.5 truncate">{retiredStandings.map((s) => s.d).join(" · ")}</p>
             </div>
           )}
 
@@ -832,15 +1330,14 @@ export default function ReplayTab({
           {recentRc.length > 0 && (
             <div className="absolute bottom-3 left-3 flex flex-col gap-1.5 pointer-events-none select-none" style={{ maxWidth: "min(360px, 45%)" }}>
               <AnimatePresence mode="popLayout">
-                {recentRc.map((msg, i) => {
+                {recentRc.slice(-1).map((msg) => {
                   const flagColor = FLAG_COLORS[msg.flag?.toUpperCase()] ?? undefined;
-                  const isLatest = i === recentRc.length - 1;
                   const accentColor = flagColor ?? (isDark ? "rgba(255,255,255,0.15)" : "rgba(0,0,0,0.1)");
                   return (
                     <motion.div
                       key={`rc-${msg.t}-${msg.msg}`}
                       initial={{ opacity: 0, x: -24, scale: 0.95 }}
-                      animate={{ opacity: isLatest ? 1 : 0.45, x: 0, scale: isLatest ? 1 : 0.97 }}
+                      animate={{ opacity: 1, x: 0, scale: 1 }}
                       exit={{ opacity: 0, x: -16, scale: 0.95 }}
                       transition={{ type: "spring", stiffness: 400, damping: 30 }}
                       className="rounded-lg border border-border/50 backdrop-blur-xl shadow-lg overflow-hidden"
@@ -880,19 +1377,8 @@ export default function ReplayTab({
         {/* Standings panel */}
         <div className="w-80 shrink-0 border-l border-border bg-card flex flex-col overflow-hidden">
           {/* Header */}
-          <div className="px-3 py-2 border-b border-border flex items-center justify-between shrink-0 bg-muted/30">
-            <div>
-              <h3 className="text-xs font-bold uppercase tracking-wider text-foreground">Live Standings</h3>
-              {currentFrame && (
-                <p className="text-[10px] text-muted-foreground">Lap {currentFrame.lap}/{data.total_laps} · {fmt(currentFrame.elapsed)}</p>
-              )}
-            </div>
-            <button
-              onClick={() => setGapMode((p) => p === "interval" ? "gap" : "interval")}
-              className="text-[9px] px-2 py-0.5 rounded bg-muted text-muted-foreground hover:bg-muted/80 font-bold transition"
-            >
-              {gapMode === "interval" ? "INT" : "GAP"}
-            </button>
+          <div className="px-3 py-2 border-b border-border shrink-0 bg-muted/30">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-foreground">Live Standings</h3>
           </div>
 
           {/* Column headers */}
@@ -910,6 +1396,7 @@ export default function ReplayTab({
             {activeStandings.map((s, i) => {
               const color = data.drivers[s.d]?.color ?? "#888";
               const isFoc = focused.includes(s.d);
+              const isBattle = battleDriverSet.has(s.d);
               const gapVal = gapMode === "interval" ? s.interval : s.gap;
               const isTop3 = i < 3;
 
@@ -920,7 +1407,9 @@ export default function ReplayTab({
                   className={`flex items-center px-2.5 py-[5px] cursor-pointer transition-colors border-b border-border/10 ${
                     isFoc
                       ? "bg-primary/8 border-l-[3px] border-l-primary"
-                      : "hover:bg-muted/30"
+                      : isBattle
+                        ? "bg-orange-500/5 hover:bg-orange-500/10"
+                        : "hover:bg-muted/30"
                   }`}
                 >
                   <span className={`w-5 text-center font-bold text-[11px] ${isTop3 ? "text-foreground" : "text-muted-foreground"}`}>
@@ -939,6 +1428,7 @@ export default function ReplayTab({
                   <span className="flex-1 text-right text-[9px] font-mono text-muted-foreground pr-1 truncate">
                     {i === 0 ? `L${s.l}` : gapVal || `L${s.l}`}
                   </span>
+                  {isBattle && <span className="text-[8px] text-orange-500 font-bold">⚔</span>}
                 </div>
               );
             })}
@@ -946,13 +1436,13 @@ export default function ReplayTab({
             {/* Retired block */}
             {retiredStandings.length > 0 && (
               <div className="px-2.5 py-1.5 border-t border-border/30">
-                <p className="text-[9px] text-muted-foreground font-bold uppercase mb-1">Retired</p>
+                <p className="text-[9px] text-muted-foreground font-bold uppercase mb-1">Retired / DNF</p>
                 <div className="flex flex-wrap gap-1">
                   {retiredStandings.map((s) => {
                     const color = data.drivers[s.d]?.color ?? "#888";
                     return (
                       <span key={s.d} className="text-[9px] font-bold px-1.5 py-0.5 rounded" style={{ backgroundColor: color + "18", color }}>
-                        {s.d}
+                        {s.d} DNF
                       </span>
                     );
                   })}
@@ -963,6 +1453,77 @@ export default function ReplayTab({
 
           {/* Driver selection pills */}
           <div className="px-2.5 py-2 border-t border-border bg-muted/20 shrink-0">
+            {/* Battle hints */}
+            <div className="mb-2 rounded border border-border/60 bg-card/50 p-2 text-[9px]">
+              <p className="font-bold text-[9px] uppercase tracking-wider text-muted-foreground mb-1">Battle Focus</p>
+              <p className="text-[8px] text-muted-foreground mb-1">
+                Prob = gap (&lt;1.2s) + delta speed + DRS + trend (closing/dropping).
+              </p>
+              {battleHints.length === 0 ? (
+                <p className="text-muted-foreground">No sub-1.2s battles right now</p>
+              ) : (
+                <div className="space-y-0.5">
+                  {battleHints.slice(0, 3).map((b) => (
+                    <div key={`${b.behind}-${b.ahead}`} className="flex items-center justify-between">
+                      <span className="truncate">{b.behind} {"->"} {b.ahead}</span>
+                      <span className="font-mono text-muted-foreground">
+                        {b.gapSec.toFixed(1)}s
+                        {" · "}
+                        {(b.overtakeProb * 100).toFixed(0)}%
+                        {" · "}
+                        {(() => {
+                          const key = `${b.behind}->${b.ahead}`;
+                          const prev = prevGapMap.get(key);
+                          if (prev == null) return "flat";
+                          const d = prev - b.gapSec;
+                          if (d > 0.04) return "closing";
+                          if (d < -0.04) return "dropping";
+                          return "flat";
+                        })()}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Strategy intelligence for selected driver */}
+            {selectedDriverCode && (
+              <div className="mb-2 rounded border border-border/60 bg-card/50 p-2 text-[9px] space-y-0.5">
+                <p className="font-bold text-muted-foreground uppercase tracking-wider">Strategy Intel · {selectedDriverCode}</p>
+                <p className="text-[8px] text-muted-foreground">
+                  Estimates from tyre age, current position, lap context and pit-loss baseline.
+                </p>
+                {strategyIntel ? (
+                  <>
+                    <p>Undercut: <span className={strategyIntel.undercutDelta < 0 ? "text-green-600" : "text-orange-500"}>{strategyIntel.undercutDelta.toFixed(1)}s</span></p>
+                    <p>Overcut: <span className={strategyIntel.overcutDelta < 0 ? "text-green-600" : "text-orange-500"}>{strategyIntel.overcutDelta.toFixed(1)}s</span></p>
+                    <p>Rejoin ~P{strategyIntel.rejoinPos} · Pit loss {strategyIntel.pitLossSec}s</p>
+                    <p>Projected tyre life L{strategyIntel.projectedTyreLife}</p>
+                  </>
+                ) : (
+                  <p className="text-muted-foreground">No strategy data available.</p>
+                )}
+                {tyreCliff && (
+                  <p>
+                    Tyre cliff risk:
+                    <span className={tyreCliff.risk === "HIGH" ? "text-red-500 ml-1 font-bold" : tyreCliff.risk === "MEDIUM" ? "text-orange-500 ml-1 font-bold" : "text-green-600 ml-1 font-bold"}>
+                      {tyreCliff.risk}
+                    </span>
+                    <span className="text-muted-foreground ml-1">({tyreCliff.delta >= 0 ? "+" : ""}{tyreCliff.delta.toFixed(2)}s)</span>
+                  </p>
+                )}
+                {restartPerf != null && (
+                  <p>
+                    Restart score:
+                    <span className={restartPerf > 0 ? "text-green-600 ml-1 font-bold" : restartPerf < 0 ? "text-red-500 ml-1 font-bold" : "text-muted-foreground ml-1 font-bold"}>
+                      {restartPerf > 0 ? "+" : ""}{restartPerf} pos
+                    </span>
+                  </p>
+                )}
+              </div>
+            )}
+
             {focused.length > 0 ? (
               <div className="flex items-center gap-1 flex-wrap">
                 <span className="text-[8px] text-muted-foreground uppercase font-bold mr-1">Comparing:</span>
